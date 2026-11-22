@@ -1,0 +1,659 @@
+#!/usr/bin/env python3
+"""realm — a shared space for agents to work together.
+
+One SQLite file. Typed nodes. Two enforcement gates.
+
+Schema and concurrency model converged with Codex's spec (2026-11-10);
+implementation and gates by OpenCode.
+
+Exit codes: 0 ok | 1 usage | 2 refused(gate) | 3 missing | 4 lease
+            5 verify FAIL | 7 internal | 8 uncheckable
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+from contextlib import contextmanager
+from pathlib import Path
+
+SCHEMA = Path(__file__).resolve().with_name("schema.sql")
+DEFAULT_TTL = 900
+TRIVIAL_MS = 50
+EXIT_OK, EXIT_USAGE, EXIT_REFUSED, EXIT_MISSING, EXIT_LEASE = 0, 1, 2, 3, 4
+EXIT_VFAIL, EXIT_INTERNAL, EXIT_UNCHECK = 5, 7, 8
+
+TRIVIAL_CMDS = {"true", ":", "exit 0", "/bin/true", "pass", "ok", "echo"}
+
+
+# ---------------------------------------------------------------- plumbing
+
+def now_ts() -> int:
+    return int(time.time())
+
+
+def space_dir() -> Path:
+    env = os.environ.get("REALM_SPACE")
+    if env:
+        return Path(env)
+    here = Path.cwd()
+    for p in [here, *here.parents]:
+        cand = p / ".realm"
+        if cand.is_dir():
+            return cand
+    sys.exit("realm: no space found. run `realm init`.")
+
+
+def db_file() -> Path:
+    return space_dir() / "space.db"
+
+
+def actor() -> str:
+    return os.environ.get("REALM_AGENT") or os.environ.get("AGENT_NAME") or "unknown"
+
+
+def connect() -> sqlite3.Connection:
+    p = db_file()
+    if not p.exists():
+        sys.exit("realm: space not initialised. run `realm init`.")
+    con = sqlite3.connect(str(p), timeout=10.0, isolation_level=None)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA foreign_keys=ON")
+    con.execute("PRAGMA busy_timeout=10000")
+    return con
+
+
+@contextmanager
+def txn(con):
+    """BEGIN IMMEDIATE … COMMIT. Serialises writers; WAL keeps readers moving."""
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        yield con
+    except BaseException:
+        con.execute("ROLLBACK")
+        raise
+    else:
+        con.execute("COMMIT")
+
+
+def emit(con, op, node=None, resource=None, token=None, detail=None):
+    con.execute("INSERT INTO events(at,actor,op,node_id,resource,token,detail) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (now_ts(), actor(), op, node, resource, token, detail))
+
+
+def get_node(con, nid: str) -> sqlite3.Row:
+    row = con.execute("SELECT * FROM nodes WHERE id=?", (nid,)).fetchone()
+    if row is None:
+        print(f"realm: no such node {nid}", file=sys.stderr)
+        sys.exit(EXIT_MISSING)
+    return row
+
+
+def new_id(con, kind: str) -> str:
+    pre = {"task": "T", "fact": "F", "decision": "D", "artifact": "A", "attempt": "X"}[kind]
+    row = con.execute("SELECT COALESCE(MAX(CAST(SUBSTR(id,2) AS INTEGER)),0) n "
+                      "FROM nodes WHERE kind=? AND id GLOB ?", (kind, f"{pre}[0-9]*")).fetchone()
+    return f"{pre}{row['n'] + 1:03d}"
+
+
+# ---------------------------------------------------------------- taint
+
+def assumed_roots(con) -> list[str]:
+    """Facts explicitly assumed via `cite --assume` (flag), plus any fact named by an
+    `assumes` edge. Only those not currently VERIFIED are taint roots."""
+    roots = {r["node_id"] for r in con.execute(
+        "SELECT node_id FROM facts WHERE assumed=1 AND status <> 'VERIFIED'")}
+    roots |= {r["to_id"] for r in con.execute(
+        "SELECT to_id FROM edges WHERE kind='assumes'")}
+    return [r for r in roots
+            if (con.execute("SELECT status FROM facts WHERE node_id=?", (r,)).fetchone()
+                or {"status": "VERIFIED"})["status"] != "VERIFIED"]
+
+
+def closure(con, roots: list[str]) -> set[str]:
+    """Transitive dependents. Edges point dependent -> prerequisite, so we walk to_id -> from_id."""
+    seen: set[str] = set()
+    frontier = list(roots)
+    while frontier:
+        cur = frontier.pop()
+        for r in con.execute(
+                "SELECT from_id FROM edges WHERE to_id=? AND kind IN "
+                "('requires','depends_on','cites','assumes')", (cur,)):
+            n = r["from_id"]
+            if n not in seen:
+                seen.add(n)
+                frontier.append(n)
+    return seen - set(roots)
+
+
+def tainted_set(con) -> set[str]:
+    roots = assumed_roots(con)
+    return closure(con, roots) if roots else set()
+
+
+def refresh_taint(con) -> set[str]:
+    """Materialize taint. Called before any gate reads it."""
+    t = tainted_set(con)
+    con.execute("UPDATE nodes SET tainted=0 WHERE tainted=1")
+    if t:
+        con.executemany("UPDATE nodes SET tainted=1 WHERE id=?", [(x,) for x in t])
+    return t
+
+
+# ---------------------------------------------------------------- checks
+
+def run_check(cmd: str, timeout: int = 60):
+    if cmd.strip().lower() in TRIVIAL_CMDS:
+        return 0, "(trivial check)", 0, True
+    project = space_dir().parent
+    env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+           "HOME": str(project), "TMPDIR": str(space_dir() / "tmp")}
+    t0 = time.monotonic()
+    try:
+        r = subprocess.run(cmd, shell=True, cwd=str(project), env=env,
+                           timeout=timeout, capture_output=True, text=True)
+        ms = int((time.monotonic() - t0) * 1000)
+        out = ((r.stdout or "") + (r.stderr or ""))[:2000]
+        return r.returncode, out, ms, (r.returncode == 0 and ms < TRIVIAL_MS and not out.strip())
+    except subprocess.TimeoutExpired:
+        return 124, "(timeout)", int((time.monotonic() - t0) * 1000), False
+
+
+def input_hash(fact_id: str, claim: str, check_hash: str | None) -> str:
+    """Cheap, honest input identity: the claim text and the check descriptor.
+    Codex's version also hashes git HEAD and scoped file bytes; that is strictly better and
+    is tracked as an open improvement — see KNOWN-DEFECTS.md."""
+    h = hashlib.sha256()
+    h.update(json.dumps({"fact": fact_id, "claim": claim, "check": check_hash},
+                        sort_keys=True, separators=(",", ":")).encode())
+    return h.hexdigest()[:16]
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_init(a):
+    root = Path(a.path or ".").resolve()
+    sp = root / ".realm"
+    sp.mkdir(exist_ok=True)
+    (sp / "tmp").mkdir(exist_ok=True)
+    con = sqlite3.connect(str(sp / "space.db"), isolation_level=None)
+    con.executescript(SCHEMA.read_text())
+    con.close()
+    print(f"realm: initialised {sp}")
+    return EXIT_OK
+
+
+def cmd_add(a):
+    con = connect()
+    with txn(con):
+        nid = a.id or new_id(con, a.kind)
+        ts = now_ts()
+        con.execute("INSERT INTO nodes(id,kind,title,body,created_by,created_at,updated_at) "
+                    "VALUES (?,?,?,?,?,?,?)",
+                    (nid, a.kind, a.title, a.body or "", actor(), ts, ts))
+        if a.kind == "task":
+            con.execute("INSERT INTO tasks(node_id,state,priority,cost) VALUES (?,?,?,?)",
+                        (nid, "OPEN", a.priority, a.cost))
+        elif a.kind == "fact":
+            ch = hashlib.sha256(a.check.encode()).hexdigest()[:16] if a.check else None
+            status = "UNVERIFIED" if a.check else "UNCHECKABLE"
+            con.execute("INSERT INTO facts(node_id,claim,status,check_cmd,check_hash,attempt_limit) "
+                        "VALUES (?,?,?,?,?,?)",
+                        (nid, a.title, status, a.check, ch, a.attempt_limit))
+        elif a.kind == "decision":
+            con.execute("INSERT INTO decisions(node_id,rationale) VALUES (?,?)", (nid, a.body or ""))
+        elif a.kind == "artifact":
+            p = Path(a.path) if a.path else None
+            if p and p.is_file():
+                digest = hashlib.sha256(p.read_bytes()).hexdigest()
+                con.execute("INSERT INTO artifacts(node_id,digest,byte_count,source_path) "
+                            "VALUES (?,?,?,?)", (nid, digest, p.stat().st_size, str(p)))
+            else:
+                print("realm: artifact needs --path to an existing file", file=sys.stderr)
+                return EXIT_USAGE
+        elif a.kind == "attempt":
+            con.execute("INSERT INTO attempts(node_id,run_id,run_kind,argv_json,cwd,started_at) "
+                        "VALUES (?,?,?,?,?,?)",
+                        (nid, a.id or nid, "run", json.dumps([a.title]), str(Path.cwd()), ts))
+        for dep in (a.depends_on or []):
+            get_node(con, dep)
+            con.execute("INSERT INTO edges(from_id,to_id,kind,at) VALUES (?,?,?,?) "
+                        "ON CONFLICT DO NOTHING", (nid, dep, "requires", ts))
+        emit(con, "add", nid, detail=f"{a.kind}:{a.title[:60]}")
+        print(nid)
+    return EXIT_OK
+
+
+def cmd_take(a):
+    con = connect()
+    ts = now_ts()
+    ttl = DEFAULT_TTL if a.ttl is None else a.ttl
+    if ttl < 0:
+        print(f"realm: --ttl must be >= 0 (got {ttl})", file=sys.stderr)
+        return EXIT_USAGE
+    with txn(con):
+        node = get_node(con, a.task)
+        if node["kind"] != "task":
+            print(f"realm: {a.task} is a {node['kind']}, not a task", file=sys.stderr)
+            return EXIT_USAGE
+        if node["id"]:
+            st = con.execute("SELECT state FROM tasks WHERE node_id=?", (a.task,)).fetchone()
+            if st and st["state"] == "DONE":
+                print(f"realm: {a.task} is already DONE", file=sys.stderr)
+                return EXIT_REFUSED
+        # single CAS statement: win only if free or expired
+        cur = con.execute(
+            "INSERT INTO leases(resource,owner,fencing_token,acquired_at,expires_at) "
+            "VALUES (?,?,1,?,?) "
+            "ON CONFLICT(resource) DO UPDATE SET "
+            "  owner=excluded.owner, "
+            "  fencing_token=leases.fencing_token+1, "
+            "  acquired_at=excluded.acquired_at, "
+            "  expires_at=excluded.expires_at "
+            "WHERE leases.owner IS NULL OR leases.expires_at <= ?",
+            (a.task, actor(), ts, ts + ttl, ts))
+        if cur.rowcount == 0:
+            held = con.execute("SELECT * FROM leases WHERE resource=?", (a.task,)).fetchone()
+            print(f"realm: {a.task} leased by {held['owner']} until "
+                  f"{time.strftime('%H:%M:%S', time.localtime(held['expires_at']))}",
+                  file=sys.stderr)
+            return EXIT_LEASE
+        tok = con.execute("SELECT fencing_token FROM leases WHERE resource=?",
+                          (a.task,)).fetchone()["fencing_token"]
+        emit(con, "take", a.task, a.task, tok, f"ttl={ttl}")
+        print(f"{a.task} leased to {actor()} token={tok} ttl={ttl}")
+    return EXIT_OK
+
+
+def _hold(con, task: str):
+    """Return the lease row if this actor holds an unexpired lease, else None."""
+    r = con.execute("SELECT * FROM leases WHERE resource=?", (task,)).fetchone()
+    if r is None or r["owner"] != actor():
+        return None
+    if r["expires_at"] is None or r["expires_at"] <= now_ts():
+        return None
+    return r
+
+
+def cmd_verify(a):
+    con = connect()
+    node = get_node(con, a.fact)
+    if node["kind"] != "fact":
+        print(f"realm: {a.fact} is a {node['kind']}, not a fact", file=sys.stderr)
+        return EXIT_USAGE
+    f = con.execute("SELECT * FROM facts WHERE node_id=?", (a.fact,)).fetchone()
+    if not f["check_cmd"]:
+        with txn(con):
+            con.execute("UPDATE facts SET status='UNCHECKABLE' WHERE node_id=?", (a.fact,))
+            con.execute("UPDATE nodes SET updated_at=? WHERE id=?", (now_ts(), a.fact))
+            emit(con, "verify-uncheckable", a.fact)
+        print(f"{a.fact} UNCHECKABLE (no check registered)")
+        return EXIT_UNCHECK
+
+    ih = input_hash(a.fact, f["claim"], f["check_hash"])
+    if not a.force:
+        cached = con.execute(
+            "SELECT * FROM verify_cache WHERE fact_id=? AND check_hash=? AND input_hash=?",
+            (a.fact, f["check_hash"], ih)).fetchone()
+        if cached:
+            print(f"{a.fact} {cached['result']} (cached, {cached['strength'] or 'OK'})")
+            return EXIT_OK if cached["result"] == "PASS" else EXIT_VFAIL
+
+    # attempt loop honours attempt_limit
+    exit_code = 1
+    out = ""
+    ms = 0
+    trivial = False
+    attempts = 0
+    while attempts < max(1, f["attempt_limit"]):
+        attempts += 1
+        exit_code, out, ms, trivial = run_check(f["check_cmd"])
+        if exit_code == 0:
+            break
+
+    flaky = False
+    hist = con.execute(
+        "SELECT result FROM verify_cache WHERE fact_id=? AND check_hash=? "
+        "ORDER BY updated_at DESC LIMIT 6", (a.fact, f["check_hash"])).fetchall()
+    if len(hist) >= 4 and len({h["result"] for h in hist}) > 1:
+        flaky = True
+    strength = "TRIVIAL" if trivial else ("FLAKY" if flaky else "OK")
+
+    ok = exit_code == 0
+    if ok:
+        status = "VERIFIED"
+    else:
+        # contradiction: previously passed, now fails
+        prev = con.execute("SELECT result FROM verify_cache WHERE fact_id=? AND check_hash=? "
+                           "ORDER BY updated_at DESC LIMIT 1", (a.fact, f["check_hash"])).fetchone()
+        status = "CONTESTED" if (prev and prev["result"] == "PASS") else "REFUTED"
+
+    with txn(con):
+        con.execute("UPDATE facts SET status=?, check_exit=?, check_out=?, checked_at=?, "
+                    "check_strength=?, rerun_after_taint=? WHERE node_id=?",
+                    (status, exit_code, out, now_ts(), strength,
+                     1 if a.force else 0, a.fact))
+        con.execute("UPDATE nodes SET updated_at=? WHERE id=?", (now_ts(), a.fact))
+        con.execute("INSERT INTO verify_cache(fact_id,check_hash,input_hash,result,"
+                    "attempt_count,strength,updated_at) VALUES (?,?,?,?,?,?,?) "
+                    "ON CONFLICT(fact_id,check_hash,input_hash) DO UPDATE SET "
+                    "result=excluded.result, attempt_count=excluded.attempt_count, "
+                    "strength=excluded.strength, updated_at=excluded.updated_at",
+                    (a.fact, f["check_hash"], ih, "PASS" if ok else "FAIL",
+                     attempts, strength, now_ts()))
+        emit(con, "verify", a.fact, detail=f"{status} exit={exit_code} {ms}ms {strength}")
+
+    if trivial:
+        print(f"{a.fact} {status} ({strength}: a trivial check proves nothing to others)")
+    else:
+        print(f"{a.fact} {status} exit={exit_code} {ms}ms attempts={attempts}")
+    return EXIT_OK if ok else EXIT_VFAIL
+
+
+def cmd_done(a):
+    """GATE 1: refuse unless every required fact is VERIFIED and untainted."""
+    con = connect()
+    with txn(con):
+        node = get_node(con, a.task)
+        if node["kind"] != "task":
+            return EXIT_USAGE
+        lease = _hold(con, a.task)
+        if lease is None:
+            cur = con.execute("SELECT * FROM leases WHERE resource=?", (a.task,)).fetchone()
+            if cur and cur["owner"] == actor():
+                print(f"realm: REFUSED — your lease on {a.task} expired. Re-take it.",
+                      file=sys.stderr)
+                return EXIT_REFUSED
+            print(f"realm: {a.task} is not leased to you "
+                  f"(holder: {cur['owner'] if cur else 'none'})", file=sys.stderr)
+            return EXIT_LEASE
+
+        tainted = refresh_taint(con)   # must be computed before reading any fact status
+        blocking = []
+        for r in con.execute(
+                "SELECT f.node_id, f.status FROM edges e "
+                "JOIN facts f ON f.node_id = e.to_id "
+                "WHERE e.from_id=? AND e.kind IN ('requires','depends_on')", (a.task,)):
+            why = []
+            if r["status"] != "VERIFIED":
+                why.append(r["status"])
+            if r["node_id"] in tainted:
+                why.append("tainted")
+            if why:
+                blocking.append((r["node_id"], ",".join(why)))
+
+        if blocking:
+            print(f"realm: REFUSED — {len(blocking)} unresolved fact(s) block {a.task}:",
+                  file=sys.stderr)
+            for nid, why in blocking:
+                print(f"    {nid}  {why}", file=sys.stderr)
+                print(f"    fix: realm verify {nid}", file=sys.stderr)
+            emit(con, "done-refused", a.task, a.task, lease["fencing_token"],
+                 f"blocked={','.join(b[0] for b in blocking)}")
+            return EXIT_REFUSED
+
+        con.execute("UPDATE tasks SET state='DONE' WHERE node_id=?", (a.task,))
+        con.execute("UPDATE nodes SET updated_at=? WHERE id=?", (now_ts(), a.task))
+        con.execute("DELETE FROM leases WHERE resource=?", (a.task,))
+        emit(con, "done", a.task, a.task, lease["fencing_token"])
+        print(f"{a.task} DONE")
+    return EXIT_OK
+
+
+def cmd_cite(a):
+    """GATE 2: refuse unverified; --assume allows a hypothesis and taints dependents."""
+    con = connect()
+    with txn(con):
+        node = get_node(con, a.fact)
+        if node["kind"] != "fact":
+            return EXIT_USAGE
+        f = con.execute("SELECT * FROM facts WHERE node_id=?", (a.fact,)).fetchone()
+        status = f["status"]
+        trivial = f["check_strength"] == "TRIVIAL"
+        author = node["created_by"]
+
+        if status == "VERIFIED" and not trivial:
+            if a.for_node:
+                con.execute("INSERT INTO edges(from_id,to_id,kind,at) VALUES (?,?,?,?) "
+                            "ON CONFLICT DO NOTHING", (a.for_node, a.fact, "cites", now_ts()))
+            emit(con, "cite", a.fact, detail="ok")
+            print(f"cite ok: {a.fact} {f['claim'][:60]}")
+            return EXIT_OK
+
+        if status == "VERIFIED" and trivial:
+            if actor() == author:
+                print(f"cite ok (warning): {a.fact} passed only a TRIVIAL check — "
+                      f"it proves nothing to other agents")
+                return EXIT_OK
+            print(f"realm: REFUSED — {a.fact} passed only a TRIVIAL check registered by "
+                  f"{author}; it cannot be cited by anyone else.\n"
+                  f"    fix: register a check that can fail, then realm verify {a.fact}",
+                  file=sys.stderr)
+            return EXIT_REFUSED
+
+        if status == "CONTESTED":
+            print(f"realm: REFUSED — {a.fact} is CONTESTED: a replay failed after it passed.\n"
+                  f"    fix: realm verify {a.fact} --force", file=sys.stderr)
+            return EXIT_REFUSED
+        if status == "REFUTED":
+            print(f"realm: REFUSED — {a.fact} is REFUTED by its own check.", file=sys.stderr)
+            return EXIT_REFUSED
+
+        if a.assume:
+            con.execute("UPDATE facts SET assumed=1 WHERE node_id=?", (a.fact,))
+            if a.for_node:
+                con.execute("INSERT INTO edges(from_id,to_id,kind,at) VALUES (?,?,?,?) "
+                            "ON CONFLICT DO NOTHING", (a.for_node, a.fact, "assumes", now_ts()))
+            emit(con, "cite-assume", a.fact, detail=f"status={status}")
+            print(f"cite ASSUMED: {a.fact} — anything depending on it is now tainted.\n"
+                  f"    `done` will refuse on any task that depends on a tainted fact.")
+            return EXIT_OK
+
+        print(f"realm: REFUSED — {a.fact} is {status}.\n"
+              f"    fix: realm verify {a.fact}   (this refusal is the system working)",
+              file=sys.stderr)
+        return EXIT_REFUSED
+
+
+def cmd_link(a):
+    con = connect()
+    with txn(con):
+        get_node(con, a.src)
+        get_node(con, a.dst)
+        con.execute("INSERT INTO edges(from_id,to_id,kind,at) VALUES (?,?,?,?) "
+                    "ON CONFLICT DO NOTHING", (a.src, a.dst, a.kind, now_ts()))
+        emit(con, "link", a.src, detail=f"{a.kind}->{a.dst}")
+        print(f"{a.src} {a.kind} {a.dst}")
+    return EXIT_OK
+
+
+def cmd_state(a):
+    con = connect()
+    t = refresh_taint(con)
+    ts = now_ts()
+    last = con.execute("SELECT COALESCE(MAX(cursor),0) c FROM events").fetchone()["c"]
+    live = con.execute("SELECT * FROM leases WHERE expires_at > ?", (ts,)).fetchall()
+    stale = con.execute("SELECT * FROM leases WHERE expires_at <= ?", (ts,)).fetchall()
+
+    rows = con.execute(
+        "SELECT n.id, n.kind, n.title, n.tainted, t.priority, t.cost, "
+        "       COALESCE(f.status,'') AS fstatus, COALESCE(f.check_strength,'') AS strength "
+        "FROM nodes n "
+        "LEFT JOIN tasks t ON t.node_id = n.id "
+        "LEFT JOIN facts f ON f.node_id = n.id "
+        "WHERE (t.state = 'OPEN') "
+        "   OR (f.status IN ('UNVERIFIED','CONTESTED','UNCHECKABLE')) "
+        "ORDER BY COALESCE(t.priority,50) DESC, COALESCE(t.cost,1) ASC, n.created_at ASC").fetchall()
+
+    out = [f"REALM  seq={last}  t={time.strftime('%H:%M:%S', time.localtime(ts))}",
+           f"frontier={len(rows)}  live_leases={len(live)}  stale={len(stale)}  tainted={len(t)}"]
+    out.append("leased: " + (", ".join(f"{r['resource']}->{r['owner']}" for r in live) or "none"))
+    if rows:
+        out.append("")
+        out.append("FRONTIER")
+        for r in rows:
+            mark = " TAINTED" if r["id"] in t else ""
+            extra = f"[{r['fstatus']}{'/' + r['strength'] if r['strength'] else ''}]" if r["fstatus"] else ""
+            out.append(f"  {r['id']:5s} {r['kind']:8s} {extra:18s}{mark:9s} {r['title'][:52]}")
+    text = "\n".join(out)
+    if a.budget:
+        text = text[: a.budget * 4]
+    print(text)
+    return EXIT_OK
+
+
+def cmd_since(a):
+    con = connect()
+    rows = con.execute("SELECT * FROM events WHERE cursor > ? ORDER BY cursor",
+                       (a.cursor,)).fetchall()
+    if not rows:
+        print(f"(no events since {a.cursor})")
+        return EXIT_OK
+    for r in rows:
+        print(f"{r['cursor']:6d} {time.strftime('%H:%M:%S', time.localtime(r['at']))} "
+              f"{r['actor'][:12]:12s} {r['op']:16s} {(r['node_id'] or ''):6s} "
+              f"{(r['detail'] or '')[:48]}")
+    return EXIT_OK
+
+
+def cmd_show(a):
+    con = connect()
+    n = get_node(con, a.id)
+    print(json.dumps({k: n[k] for k in n.keys()}, indent=2))
+    for tbl in ("tasks", "facts", "decisions", "artifacts", "attempts"):
+        r = con.execute(f"SELECT * FROM {tbl} WHERE node_id=?", (a.id,)).fetchone()
+        if r:
+            print(f"\n{tbl}:")
+            print(json.dumps({k: r[k] for k in r.keys()}, indent=2))
+    print("\nedges:")
+    for r in con.execute("SELECT kind,to_id FROM edges WHERE from_id=?", (a.id,)):
+        print(f"  {r['kind']:12s} -> {r['to_id']}")
+    for r in con.execute("SELECT kind,from_id FROM edges WHERE to_id=?", (a.id,)):
+        print(f"  {r['kind']:12s} <- {r['from_id']}")
+    return EXIT_OK
+
+
+def cmd_run(a):
+    cmd = list(a.command)
+    # argparse.REMAINDER keeps a literal leading "--"; strip it so `run -- echo hi` works
+    while cmd and cmd[0] == "--":
+        cmd.pop(0)
+    if not cmd:
+        print("realm: run needs a command after --", file=sys.stderr)
+        return EXIT_USAGE
+    con = connect()
+    if a.attach:
+        get_node(con, a.attach)   # reject unknown attachment before any side effect
+    started = now_ts()
+    try:
+        r = subprocess.run(cmd)
+        rc = r.returncode
+    except (FileNotFoundError, PermissionError, NotADirectoryError) as e:
+        print(f"realm: cannot execute {cmd[0]!r}: {e.strerror or e}", file=sys.stderr)
+        rc = 127
+    rev = ""
+    try:
+        rev = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                             capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:
+        pass
+    with txn(con):
+        nid = new_id(con, "attempt")
+        con.execute("INSERT INTO nodes(id,kind,title,body,created_by,created_at,updated_at) "
+                    "VALUES (?,?,?,?,?,?,?)",
+                    (nid, "attempt", " ".join(cmd)[:120], "", actor(), started, now_ts()))
+        con.execute("INSERT INTO attempts(node_id,run_id,run_kind,target_id,argv_json,cwd,"
+                    "git_rev,started_at,finished_at,exit_code) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (nid, nid, "run", a.attach, json.dumps(cmd), str(Path.cwd()),
+                     rev, started, now_ts(), rc))
+        if a.attach:
+            con.execute("INSERT INTO edges(from_id,to_id,kind,at) VALUES (?,?,?,?) "
+                        "ON CONFLICT DO NOTHING", (nid, a.attach, "produces", now_ts()))
+        emit(con, "run", nid, detail=f"{' '.join(cmd)[:50]} exit={rc}")
+        print(f"[realm] {nid} recorded exit={rc} rev={rev or '-'}", file=sys.stderr)
+    return rc
+
+
+def cmd_ui(a):
+    """Delegate to realm_ui.py — a read-only lens over the space."""
+    import importlib.util
+    here = Path(__file__).resolve().parent
+    spec = importlib.util.spec_from_file_location("realm_ui", here / "realm_ui.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    argv = []
+    for flag in ("once", "since", "ascii"):
+        if getattr(a, flag, False):
+            argv.append("--" + flag)
+    if a.poll is not None:
+        argv += ["--poll", str(a.poll)]
+    if a.cols:
+        argv += ["--cols", str(a.cols)]
+    if a.rows:
+        argv += ["--rows", str(a.rows)]
+    return mod.main(argv)
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="realm")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("init"); p.add_argument("--path"); p.set_defaults(fn=cmd_init)
+
+    p = sub.add_parser("add")
+    p.add_argument("kind", choices=["task", "fact", "decision", "artifact", "attempt"])
+    p.add_argument("title")
+    p.add_argument("--id"); p.add_argument("--body"); p.add_argument("--check")
+    p.add_argument("--path"); p.add_argument("--priority", type=int, default=50)
+    p.add_argument("--cost", type=int, default=1)
+    p.add_argument("--attempt-limit", type=int, default=1)
+    p.add_argument("--depends-on", action="append")
+    p.set_defaults(fn=cmd_add)
+
+    p = sub.add_parser("take"); p.add_argument("task"); p.add_argument("--ttl", type=int)
+    p.set_defaults(fn=cmd_take)
+
+    p = sub.add_parser("verify"); p.add_argument("fact"); p.add_argument("--force", action="store_true")
+    p.set_defaults(fn=cmd_verify)
+
+    p = sub.add_parser("done"); p.add_argument("task"); p.set_defaults(fn=cmd_done)
+
+    p = sub.add_parser("cite"); p.add_argument("fact")
+    p.add_argument("--assume", action="store_true"); p.add_argument("--for", dest="for_node")
+    p.set_defaults(fn=cmd_cite)
+
+    p = sub.add_parser("link")
+    p.add_argument("src"); p.add_argument("kind"); p.add_argument("dst"); p.set_defaults(fn=cmd_link)
+
+    p = sub.add_parser("state"); p.add_argument("--budget", type=int); p.set_defaults(fn=cmd_state)
+
+    p = sub.add_parser("since"); p.add_argument("cursor", type=int); p.set_defaults(fn=cmd_since)
+    p = sub.add_parser("show"); p.add_argument("id"); p.set_defaults(fn=cmd_show)
+
+    p = sub.add_parser("ui")
+    p.add_argument("--once", action="store_true")
+    p.add_argument("--since", action="store_true")
+    p.add_argument("--ascii", action="store_true")
+    p.add_argument("--poll", type=float, default=2.0)
+    p.add_argument("--cols", type=int); p.add_argument("--rows", type=int)
+    p.set_defaults(fn=cmd_ui)
+
+    p = sub.add_parser("run")
+    p.add_argument("--attach")
+    p.add_argument("command", nargs=argparse.REMAINDER)
+    p.set_defaults(fn=cmd_run)
+
+    a = ap.parse_args(argv)
+    return a.fn(a)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
